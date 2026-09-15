@@ -1,0 +1,100 @@
+{
+  "schema_version": "1.0",
+  "project_name": "Example deductive coding project",
+  "research_question": "What type of reason does the respondent provide?",
+  "unit_of_analysis": "One open-ended survey response",
+  "study_context": "Demonstration project only; replace these categories with a study-specific deductive framework.",
+  "general_instructions": "Code only what is supported by the supplied text and context. Do not infer motives, identities, or meanings that are not reasonably supported.",
+  "coding_mode": "single",
+  "allow_hierarchy": false,
+  "codes": [
+    {
+      "code_id": "A",
+      "name": "Evidence-based reason",
+      "definition": "The response explicitly refers to evidence, information, data, or documented facts.",
+      "include_when": "A reason is justified by information or evidence.",
+      "exclude_when": "The response relies only on personal experience.",
+      "parent_id": null
+    },
+    {
+      "code_id": "B",
+      "name": "Personal experience",
+      "definition": "The response explicitly bases the reason on personal experience or direct observation.",
+      "include_when": "The respondent says they experienced, saw, or encountered something themselves.",
+      "exclude_when": "The response cites only external evidence or another person.",
+      "parent_id": null
+    },
+    {
+      "code_id": "C",
+      "name": "Value-based reason",
+      "definition": "The response explicitly appeals to a value, principle, or normative standard.",
+      "include_when": "The reason depends on what the respondent considers right, fair, important, or acceptable.",
+      "exclude_when": "The statement is only descriptive and contains no value-based justification.",
+      "parent_id": null
+    },
+    {
+      "code_id": "X",
+      "name": "No applicable deductive code",
+      "definition": "The response is substantive but none of the defined deductive categories applies.",
+      "include_when": "No other code is supported.",
+      "exclude_when": "Another code clearly applies.",
+      "parent_id": null
+    }
+  ],
+  "versions": [
+    {
+      "version_id": "v1",
+      "created_at": "2026-09-09T15:07:56+00:00",
+      "note": "Example protocol",
+      "snapshot": {
+        "project_name": "Example deductive coding project",
+        "research_question": "What type of reason does the respondent provide?",
+        "unit_of_analysis": "One open-ended survey response",
+        "study_context": "Demonstration project only; replace these categories with a study-specific deductive framework.",
+        "general_instructions": "Code only what is supported by the supplied text and context. Do not infer motives, identities, or meanings that are not reasonably supported.",
+        "coding_mode": "single",
+        "allow_hierarchy": false,
+        "codes": [
+          {
+            "code_id": "A",
+            "name": "Evidence-based reason",
+            "definition": "The response explicitly refers to evidence, information, data, or documented facts.",
+            "include_when": "A reason is justified by information or evidence.",
+            "exclude_when": "The response relies only on personal experience.",
+            "parent_id": null
+          },
+          {
+            "code_id": "B",
+            "name": "Personal experience",
+            "definition": "The response explicitly bases the reason on personal experience or direct observation.",
+            "include_when": "The respondent says they experienced, saw, or encountered something themselves.",
+            "exclude_when": "The response cites only external evidence or another person.",
+            "parent_id": null
+          },
+          {
+            "code_id": "C",
+            "name": "Value-based reason",
+            "definition": "The response explicitly appeals to a value, principle, or normative standard.",
+            "include_when": "The reason depends on what the respondent considers right, fair, important, or acceptable.",
+            "exclude_when": "The statement is only descriptive and contains no value-based justification.",
+            "parent_id": null
+          },
+          {
+            "code_id": "X",
+            "name": "No applicable deductive code",
+            "definition": "The response is substantive but none of the defined deductive categories applies.",
+            "include_when": "No other code is supported.",
+            "exclude_when": "Another code clearly applies.",
+            "parent_id": null
+          }
+        ]
+      }
+    }
+  ],
+  "active_version_id": "v1",
+  "calibration_history": [],
+  "draft_dirty": false,
+  "literature_source_names": [],
+  "created_at": "2026-09-09T15:07:56+00:00",
+  "updated_at": "2026-09-09T15:07:56+00:00"
+}

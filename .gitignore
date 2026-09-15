@@ -1,0 +1,25 @@
+# Secrets
+.streamlit/secrets.toml
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local research data / outputs (adjust to your own workflow)
+data/
+outputs/
+*.sav
+*.xlsx
+*.xls
+*.csv
