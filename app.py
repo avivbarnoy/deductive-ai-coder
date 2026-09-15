@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import hmac
 import os
 import re
 import sys
@@ -11,29 +11,18 @@ import pandas as pd
 import streamlit as st
 from pydantic import ValidationError
 
-# Allow a simple `streamlit run app.py` from the repository root.
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from deductive_ai_coder.audit import build_audit_payload
-from deductive_ai_coder.data_io import (
-    read_tabular_file,
-    to_csv_bytes,
-    to_excel_bytes,
-    to_sav_bytes,
-)
+from deductive_ai_coder.data_io import read_tabular_file, to_csv_bytes, to_excel_bytes, to_sav_bytes
 from deductive_ai_coder.gemini_client import GeminiService
-from deductive_ai_coder.models import (
-    CalibrationSummary,
-    CodeDefinition,
-    ResearchProject,
-)
+from deductive_ai_coder.models import CalibrationSummary, CodeDefinition, ResearchProject
 from deductive_ai_coder.project_io import project_from_json, project_to_json
 from deductive_ai_coder.reliability import normalize_code_set, pair_metrics
 from deductive_ai_coder.text_extract import extract_text
-
 
 APP_TITLE = "Deductive AI Coder"
 PAGES = [
@@ -46,7 +35,6 @@ st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
 
 
 def read_secret(name: str, default: Any = None) -> Any:
-    """Read a server-side Streamlit secret, falling back to an environment variable."""
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -55,8 +43,9 @@ def read_secret(name: str, default: Any = None) -> Any:
     return os.getenv(name, default)
 
 
-GEMINI_API_KEY = read_secret("GEMINI_API_KEY", "")
+GEMINI_API_KEY = str(read_secret("GEMINI_API_KEY", "") or "")
 GEMINI_MODEL = str(read_secret("GEMINI_MODEL", "gemini-3.8-flash"))
+REVIEWER_ACCESS_CODE = str(read_secret("REVIEWER_ACCESS_CODE", "") or "")
 MAX_BATCH_ROWS = int(read_secret("MAX_BATCH_ROWS", 1000))
 MAX_CALIBRATION_ROWS = int(read_secret("MAX_CALIBRATION_ROWS", 100))
 
@@ -67,45 +56,78 @@ def safe_filename(value: str, fallback: str = "coding_project") -> str:
 
 
 def initialize_state() -> None:
-    if "project" not in st.session_state:
-        st.session_state.project = ResearchProject()
-    if "stage1_chat" not in st.session_state:
-        st.session_state.stage1_chat = []
-    if "literature_texts" not in st.session_state:
-        st.session_state.literature_texts = {}
-    if "calibration_results" not in st.session_state:
-        st.session_state.calibration_results = None
-    if "calibration_table" not in st.session_state:
-        st.session_state.calibration_table = None
-    if "refinement_draft" not in st.session_state:
-        st.session_state.refinement_draft = None
-    if "case_explanation" not in st.session_state:
-        st.session_state.case_explanation = ""
-    if "batch_source_df" not in st.session_state:
-        st.session_state.batch_source_df = None
-    if "batch_results" not in st.session_state:
-        st.session_state.batch_results = None
-    if "nav_page" not in st.session_state:
-        st.session_state.nav_page = PAGES[0]
-    if "calibration_signature" not in st.session_state:
-        st.session_state.calibration_signature = None
+    defaults = {
+        "project": ResearchProject(),
+        "stage1_chat": [],
+        "literature_texts": {},
+        "calibration_results": None,
+        "calibration_table": None,
+        "calibration_signature": None,
+        "calibration_editor_epoch": 0,
+        "refinement_draft": None,
+        "case_explanation": "",
+        "batch_source_df": None,
+        "batch_results": None,
+        "nav_page": PAGES[0],
+        "reviewer_authenticated": False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
 initialize_state()
-project: ResearchProject = st.session_state.project
+
+
+def enforce_reviewer_gate() -> None:
+    """Optional lightweight gate for a public reviewer deployment.
+
+    Leave REVIEWER_ACCESS_CODE empty during local development. On a hosted demo,
+    configure it as a server-side Streamlit secret. This is a convenience gate,
+    not a replacement for enterprise authentication or rate limiting.
+    """
+    if not REVIEWER_ACCESS_CODE or st.session_state.reviewer_authenticated:
+        return
+
+    st.title(APP_TITLE)
+    st.caption("Reviewer demonstration")
+    st.write("Enter the access code supplied with the proposal to open the prototype.")
+    with st.form("reviewer_access_form"):
+        entered = st.text_input("Access code", type="password")
+        submitted = st.form_submit_button("Open prototype", type="primary")
+    if submitted:
+        if hmac.compare_digest(entered, REVIEWER_ACCESS_CODE):
+            st.session_state.reviewer_authenticated = True
+            st.rerun()
+        else:
+            st.error("Incorrect access code.")
+    st.stop()
+
+
+def get_project() -> ResearchProject:
+    return st.session_state.project
+
+
+def reset_run_state() -> None:
+    st.session_state.calibration_results = None
+    st.session_state.refinement_draft = None
+    st.session_state.case_explanation = ""
+    st.session_state.batch_results = None
+
+
+def reset_calibration_editor() -> None:
+    st.session_state.calibration_editor_epoch += 1
 
 
 def get_service(require_authorization: bool = True) -> GeminiService | None:
     if not GEMINI_API_KEY:
         st.error(
-            "The server has no Gemini API key configured. The app can still be edited manually, "
-            "but AI functions are unavailable until the administrator configures the secret."
+            "The server has no Gemini API key configured. Manual editing remains available, "
+            "but AI functions require a server-side key."
         )
         return None
     if require_authorization and not st.session_state.get("data_authorized", False):
-        st.error(
-            "Please confirm the research-data/API notice in the sidebar before sending material to Gemini."
-        )
+        st.error("Confirm the research-data/API notice in the sidebar before sending material to Gemini.")
         return None
     return GeminiService(GEMINI_API_KEY, GEMINI_MODEL)
 
@@ -121,7 +143,7 @@ def protocol_status(project: ResearchProject) -> str:
 
 
 def code_rows(project: ResearchProject) -> list[dict[str, Any]]:
-    rows = []
+    rows: list[dict[str, Any]] = []
     for code in project.codes:
         row = {
             "Code ID": code.code_id,
@@ -150,27 +172,93 @@ def dataframe_to_codes(df: pd.DataFrame, allow_hierarchy: bool) -> list[CodeDefi
                 definition=str(row.get("Definition", "")),
                 include_when=str(row.get("Include when", "")),
                 exclude_when=str(row.get("Exclude when", "")),
-                parent_id=(str(row.get("Parent ID", "")).strip() or None)
-                if allow_hierarchy
-                else None,
+                parent_id=(str(row.get("Parent ID", "")).strip() or None) if allow_hierarchy else None,
             )
         )
     return codes
 
 
-def reset_run_state() -> None:
-    st.session_state.calibration_results = None
-    st.session_state.refinement_draft = None
-    st.session_state.case_explanation = ""
-    st.session_state.batch_results = None
+def blank_calibration_table(n_humans: int) -> pd.DataFrame:
+    rows: list[dict[str, str]] = []
+    for i in range(10):
+        row = {"Case ID": str(i + 1), "Text": "", "Context": "", "Human 1": ""}
+        if n_humans == 2:
+            row["Human 2"] = ""
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def demo_calibration_table(n_humans: int) -> pd.DataFrame:
+    examples = [
+        ("1", "Official statistics show the rate has decreased.", "A"),
+        ("2", "The study reports the same result across three datasets.", "A"),
+        ("3", "I experienced this myself last year.", "B"),
+        ("4", "This happened to my family, so I know it can occur.", "B"),
+        ("5", "This is wrong because everyone should be treated equally.", "C"),
+        ("6", "Fairness matters more to me than efficiency in this case.", "C"),
+        ("7", "The train left at eight this morning.", "X"),
+        ("8", "I do not really have a reason for my answer.", "X"),
+    ]
+    rows = []
+    for case_id, text, code in examples:
+        row = {"Case ID": case_id, "Text": text, "Context": "", "Human 1": code}
+        if n_humans == 2:
+            row["Human 2"] = code
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def demo_batch_dataset() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"case_id": "1", "response": "Official statistics show the rate has decreased.", "context": ""},
+            {"case_id": "2", "response": "I experienced this myself last year.", "context": ""},
+            {"case_id": "3", "response": "Everyone deserves equal treatment, so this is wrong.", "context": ""},
+            {"case_id": "4", "response": "I chose this option randomly.", "context": ""},
+        ]
+    )
+
+
+def calibration_evidence_text(results: pd.DataFrame, n_humans: int, coding_mode: str) -> str:
+    if results is None or results.empty:
+        return ""
+
+    def same(a: object, b: object) -> bool:
+        if coding_mode == "multi":
+            return normalize_code_set(str(a)) == normalize_code_set(str(b))
+        return str(a).strip() == str(b).strip()
+
+    if n_humans == 1:
+        mask = results.apply(lambda row: not same(row["AI Code"], row["Human 1"]), axis=1)
+    else:
+        mask = results.apply(
+            lambda row: (
+                not same(row["AI Code"], row["Human 1"])
+                or not same(row["AI Code"], row["Human 2"])
+                or not same(row["Human 1"], row["Human 2"])
+            ),
+            axis=1,
+        )
+
+    pieces: list[str] = []
+    for _, row in results[mask].head(20).iterrows():
+        piece = [
+            f"Case {row['Case ID']}",
+            f"Text: {row['Text']}",
+            f"Human 1: {row['Human 1']}",
+        ]
+        if n_humans == 2:
+            piece.append(f"Human 2: {row.get('Human 2', '')}")
+        piece.append(f"AI: {row['AI Code']}")
+        pieces.append("\n".join(piece))
+    return "\n\n---\n\n".join(pieces)
 
 
 def show_sidebar() -> str:
-    global project
+    project = get_project()
     with st.sidebar:
         st.title(APP_TITLE)
         st.caption("Research prototype / MVP")
-
         if GEMINI_API_KEY:
             st.success(f"Gemini configured · {GEMINI_MODEL}")
         else:
@@ -181,7 +269,7 @@ def show_sidebar() -> str:
             key="data_authorized",
         )
         st.caption(
-            "The prototype does not upload your API key from the browser. Research material used in AI functions is sent by the server to Gemini."
+            "The API key stays server-side. Material used in AI functions is sent by the server to Gemini."
         )
 
         st.divider()
@@ -192,9 +280,7 @@ def show_sidebar() -> str:
 
         st.divider()
         st.subheader("Project file")
-        project_upload = st.file_uploader(
-            "Load a saved project (.json)", type=["json"], key="project_file_upload"
-        )
+        project_upload = st.file_uploader("Load a saved project (.json)", type=["json"], key="project_file_upload")
         if st.button("Load project", width="stretch"):
             if not project_upload:
                 st.warning("Choose a project JSON file first.")
@@ -202,10 +288,13 @@ def show_sidebar() -> str:
                 try:
                     loaded = project_from_json(project_upload.getvalue())
                     st.session_state.project = loaded
-                    project = loaded
                     st.session_state.stage1_chat = []
                     st.session_state.literature_texts = {}
+                    st.session_state.calibration_table = None
+                    st.session_state.calibration_signature = None
+                    reset_calibration_editor()
                     reset_run_state()
+                    st.session_state.batch_source_df = None
                     st.success("Project loaded.")
                     st.rerun()
                 except Exception as exc:
@@ -221,61 +310,60 @@ def show_sidebar() -> str:
 
         if st.button("New blank project", width="stretch"):
             st.session_state.project = ResearchProject()
-            project = st.session_state.project
             st.session_state.stage1_chat = []
             st.session_state.literature_texts = {}
+            st.session_state.calibration_table = None
+            st.session_state.calibration_signature = None
+            reset_calibration_editor()
             reset_run_state()
+            st.session_state.batch_source_df = None
             st.rerun()
 
         st.divider()
         st.caption(
-            "Prototype note: raw calibration/full-dataset participant text is kept only in the active Streamlit session and is not included in the downloadable project JSON."
+            "Raw calibration/full-dataset participant text is kept only in the active Streamlit session and is not included in the downloadable project JSON."
         )
     return page
 
 
 def stage1() -> None:
-    global project
+    project = get_project()
     st.header("Stage 1 · Deductive Protocol Co-Design")
     st.write(
         "Define the study and codebook manually, with Gemini assistance, or using uploaded literature/source material. "
-        "The structured protocol is the source of truth for both human–AI calibration and later batch coding."
+        "The structured protocol is the source of truth for calibration and later batch coding."
     )
 
     with st.expander("1. Project setup", expanded=not bool(project.codes)):
-        col1, col2 = st.columns(2)
-        with col1:
-            project_name = st.text_input("Project name", value=project.project_name)
-            research_question = st.text_area(
-                "Research question (optional)", value=project.research_question, height=90
-            )
-            unit_of_analysis = st.text_input(
-                "Unit of analysis", value=project.unit_of_analysis,
-                placeholder="e.g., one survey response; one interview excerpt"
-            )
-        with col2:
-            study_context = st.text_area(
-                "Study/context information (optional)", value=project.study_context, height=90
-            )
-            coding_mode = st.radio(
-                "Coding mode",
-                ["single", "multi"],
-                index=0 if project.coding_mode == "single" else 1,
-                horizontal=True,
-                help="Single = exactly one code per case. Multi = one or more codes may be assigned.",
-            )
-            allow_hierarchy = st.checkbox(
-                "Allow parent/child code hierarchy", value=project.allow_hierarchy
-            )
+        with st.form("project_setup_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                project_name = st.text_input("Project name", value=project.project_name)
+                research_question = st.text_area("Research question (optional)", value=project.research_question, height=90)
+                unit_of_analysis = st.text_input(
+                    "Unit of analysis",
+                    value=project.unit_of_analysis,
+                    placeholder="e.g., one survey response; one interview excerpt",
+                )
+            with col2:
+                study_context = st.text_area("Study/context information (optional)", value=project.study_context, height=90)
+                coding_mode = st.radio(
+                    "Coding mode",
+                    ["single", "multi"],
+                    index=0 if project.coding_mode == "single" else 1,
+                    horizontal=True,
+                    help="Single = exactly one code per case. Multi = one or more codes may be assigned.",
+                )
+                allow_hierarchy = st.checkbox("Allow parent/child code hierarchy", value=project.allow_hierarchy)
 
-        general_instructions = st.text_area(
-            "General coding instructions",
-            value=project.general_instructions,
-            height=120,
-            help="Rules that apply to all codes, such as how much inference is permitted.",
-        )
+            general_instructions = st.text_area(
+                "General coding instructions",
+                value=project.general_instructions,
+                height=120,
+            )
+            apply_settings = st.form_submit_button("Apply project settings")
 
-        if st.button("Apply project settings"):
+        if apply_settings:
             before = project.current_snapshot().model_dump()
             project.project_name = project_name.strip() or "Untitled coding project"
             project.research_question = research_question.strip()
@@ -299,7 +387,7 @@ def stage1() -> None:
     with st.expander("2. Optional literature / source material"):
         st.write(
             "Upload PDF, DOCX, TXT, or Markdown files if you want Gemini to use them while helping define deductive categories. "
-            "The source text is held in the current session; the saved project records filenames only, not the source contents."
+            "Source text is held only in the current session."
         )
         uploaded_sources = st.file_uploader(
             "Source files",
@@ -312,22 +400,19 @@ def stage1() -> None:
                 st.warning("Upload at least one source file.")
             else:
                 extracted: dict[str, str] = {}
-                errors: list[str] = []
                 for file in uploaded_sources:
                     try:
                         text = extract_text(file.name, file.getvalue()).strip()
                         if text:
                             extracted[file.name] = text
                         else:
-                            errors.append(f"{file.name}: no extractable text")
+                            st.warning(f"{file.name}: no extractable text")
                     except Exception as exc:
-                        errors.append(f"{file.name}: {exc}")
+                        st.warning(f"{file.name}: {exc}")
                 st.session_state.literature_texts = extracted
                 project.literature_source_names = list(extracted.keys())
                 if extracted:
                     st.success(f"Loaded {len(extracted)} source file(s) for this session.")
-                for error in errors:
-                    st.warning(error)
         if st.session_state.literature_texts:
             st.caption("In session: " + ", ".join(st.session_state.literature_texts.keys()))
 
@@ -336,10 +421,7 @@ def stage1() -> None:
 
     with col_chat:
         st.markdown("#### AI co-design conversation")
-        st.caption(
-            "Ask Gemini to propose, define, merge, split, or clarify deductive categories. "
-            "Its proposal updates the working draft; you can edit the table directly afterward."
-        )
+        st.caption("Ask Gemini to propose, define, merge, split, or clarify deductive categories.")
         for message in st.session_state.stage1_chat:
             with st.chat_message(message["role"]):
                 st.write(message["content"])
@@ -362,13 +444,9 @@ def stage1() -> None:
                     project.general_instructions = result.general_instructions.strip()
                     project.mark_draft_changed()
                     reset_run_state()
-                    st.session_state.stage1_chat.append(
-                        {"role": "assistant", "content": result.message}
-                    )
+                    st.session_state.stage1_chat.append({"role": "assistant", "content": result.message})
                 except Exception as exc:
-                    st.session_state.stage1_chat.append(
-                        {"role": "assistant", "content": f"AI request failed: {exc}"}
-                    )
+                    st.session_state.stage1_chat.append({"role": "assistant", "content": f"AI request failed: {exc}"})
             st.rerun()
 
     with col_codebook:
@@ -377,18 +455,20 @@ def stage1() -> None:
         if project.allow_hierarchy:
             columns.append("Parent ID")
         initial_df = pd.DataFrame(code_rows(project), columns=columns)
-        edited = st.data_editor(
-            initial_df,
-            num_rows="dynamic",
-            width="stretch",
-            hide_index=True,
-            key=f"codebook_editor_{len(project.versions)}_{project.allow_hierarchy}_{len(project.codes)}",
-        )
-        if st.button("Apply manual codebook edits", width="stretch"):
+        with st.form(f"codebook_form_{len(project.versions)}_{project.allow_hierarchy}_{len(project.codes)}"):
+            edited = st.data_editor(
+                initial_df,
+                num_rows="dynamic",
+                width="stretch",
+                hide_index=True,
+                key=f"codebook_editor_{len(project.versions)}_{project.allow_hierarchy}_{len(project.codes)}",
+            )
+            apply_codebook = st.form_submit_button("Apply manual codebook edits", width="stretch")
+
+        if apply_codebook:
+            old_codes = [code.model_copy(deep=True) for code in project.codes]
             try:
                 new_codes = dataframe_to_codes(edited, project.allow_hierarchy)
-                # Validate in the full project context before accepting.
-                old_codes = project.codes
                 project.codes = new_codes
                 project.current_snapshot()
                 if [c.model_dump() for c in old_codes] != [c.model_dump() for c in new_codes]:
@@ -396,20 +476,17 @@ def stage1() -> None:
                     reset_run_state()
                 st.success("Codebook draft updated.")
             except Exception as exc:
-                project.codes = old_codes if "old_codes" in locals() else project.codes
+                project.codes = old_codes
                 st.error(f"Codebook not updated: {exc}")
 
         with st.expander("Advanced · View generated coding protocol"):
             try:
-                snapshot = project.current_snapshot()
                 from deductive_ai_coder.prompts import codebook_as_text
 
+                snapshot = project.current_snapshot()
                 st.code(
                     f"GENERAL INSTRUCTIONS\n{snapshot.general_instructions}\n\nCODEBOOK\n{codebook_as_text(snapshot)}",
                     language="text",
-                )
-                st.caption(
-                    "The actual Gemini request also includes project context, the case text, optional case context, and a structured-output instruction."
                 )
             except Exception as exc:
                 st.warning(f"Draft is not yet valid: {exc}")
@@ -431,18 +508,17 @@ def stage1() -> None:
             project.draft_dirty = False
             reset_run_state()
             st.rerun()
-    st.write(
-        "Freezing creates an immutable snapshot for calibration/full-dataset coding. Later refinements create a new version rather than silently changing an earlier run."
-    )
-    version_note = st.text_input(
-        "Version note (optional)", placeholder="e.g., Initial codebook after literature review"
-    )
+
+    version_note = st.text_input("Version note (optional)", placeholder="e.g., Initial codebook after literature review")
     if st.button("Freeze current draft as new protocol version", type="primary"):
         try:
             if not project.codes:
                 raise ValueError("Add at least one code before freezing a protocol.")
             version = project.freeze_new_version(version_note)
             reset_run_state()
+            st.session_state.calibration_signature = None
+            st.session_state.calibration_table = None
+            reset_calibration_editor()
             st.success(f"Created {version.version_id}. This version is now active.")
         except Exception as exc:
             st.error(f"Could not freeze protocol: {exc}")
@@ -464,58 +540,25 @@ def stage1() -> None:
         st.dataframe(versions_df, hide_index=True, width="stretch")
 
 
-def blank_calibration_table(n_humans: int, mode: str) -> pd.DataFrame:
-    rows = []
-    for i in range(10):
-        row = {"Case ID": str(i + 1), "Text": "", "Context": "", "Human 1": ""}
-        if n_humans == 2:
-            row["Human 2"] = ""
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def calibration_evidence_text(results: pd.DataFrame, n_humans: int, coding_mode: str) -> str:
-    if results is None or results.empty:
-        return ""
-    def same(a: object, b: object) -> bool:
-        if coding_mode == "multi":
-            return normalize_code_set(str(a)) == normalize_code_set(str(b))
-        return str(a).strip() == str(b).strip()
-
-    mask = results.apply(lambda row: not same(row["AI Code"], row["Human 1"]), axis=1)
-    if n_humans == 2 and "Human 2" in results:
-        mask = results.apply(
-            lambda row: (
-                not same(row["AI Code"], row["Human 1"])
-                or not same(row["AI Code"], row["Human 2"])
-                or not same(row["Human 1"], row["Human 2"])
-            ),
-            axis=1,
-        )
-    disagreements = results[mask].copy()
-    disagreements = disagreements.head(20)
-    pieces = []
-    for _, row in disagreements.iterrows():
-        piece = [
-            f"Case {row['Case ID']}",
-            f"Text: {row['Text']}",
-            f"Human 1: {row['Human 1']}",
-        ]
-        if n_humans == 2:
-            piece.append(f"Human 2: {row.get('Human 2', '')}")
-        piece.append(f"AI: {row['AI Code']}")
-        pieces.append("\n".join(piece))
-    return "\n\n---\n\n".join(pieces)
+def render_metric_pair(label: str, a: pd.Series, b: pd.Series, coding_mode: str) -> dict[str, float | None]:
+    metrics = pair_metrics(a, b, coding_mode)
+    st.markdown(f"**{label}**")
+    for metric_name, value in metrics.items():
+        pretty = metric_name.replace("_", " ").title().replace("Cohen Kappa", "Cohen’s κ")
+        st.metric(pretty, "N/A" if value is None else f"{value:.2f}")
+        if metric_name == "cohen_kappa" and value is None:
+            st.caption(
+                "Cohen’s κ cannot be calculated for these cases. This commonly occurs when there are too few usable cases or insufficient category variation."
+            )
+    return metrics
 
 
 def stage2() -> None:
-    global project
+    project = get_project()
     st.header("Stage 2 · Calibration Against Human Coding")
     active = project.get_active_version()
     if not active:
-        st.warning(
-            "Freeze a protocol version in Stage 1 before calibration. This prevents calibration from being run against an unfrozen draft."
-        )
+        st.warning("Freeze a protocol version in Stage 1 before calibration.")
         return
 
     snapshot = active.snapshot
@@ -524,50 +567,62 @@ def stage2() -> None:
     )
     if project.draft_dirty:
         st.warning("The working draft has newer changes. Calibration still uses the frozen active version shown above.")
+
     n_humans = st.radio("Number of human coders", [1, 2], horizontal=True, key="n_humans")
     signature = (active.version_id, n_humans, snapshot.coding_mode)
     if st.session_state.calibration_signature != signature:
         st.session_state.calibration_signature = signature
-        st.session_state.calibration_table = None
+        st.session_state.calibration_table = blank_calibration_table(n_humans)
         st.session_state.calibration_results = None
         st.session_state.refinement_draft = None
         st.session_state.case_explanation = ""
+        reset_calibration_editor()
 
     st.markdown("### Calibration cases")
     st.caption(
-        "Paste/type a small calibration sample below. 'Context' is optional case-specific information available to the AI coder."
+        "Edits in this table are submitted together when you press **Run AI coding & compare**. "
+        "This prevents Streamlit reruns from clearing the first edit."
     )
 
-    code_ids = [code.code_id for code in snapshot.codes]
-    existing = st.session_state.calibration_table
-    expected_cols = ["Case ID", "Text", "Context", "Human 1"] + (["Human 2"] if n_humans == 2 else [])
-    if existing is None or list(existing.columns) != expected_cols:
-        existing = blank_calibration_table(n_humans, snapshot.coding_mode)
+    c1, c2 = st.columns(2)
+    if c1.button("Load built-in demo cases"):
+        st.session_state.calibration_table = demo_calibration_table(n_humans)
+        st.session_state.calibration_results = None
+        reset_calibration_editor()
+        st.rerun()
+    if c2.button("Reset calibration table"):
+        st.session_state.calibration_table = blank_calibration_table(n_humans)
+        st.session_state.calibration_results = None
+        reset_calibration_editor()
+        st.rerun()
 
+    code_ids = [code.code_id for code in snapshot.codes]
     column_config: dict[str, Any] = {}
     if snapshot.coding_mode == "single":
         options = [""] + code_ids
-        column_config["Human 1"] = st.column_config.SelectboxColumn(
-            "Human 1", options=options, help="Researcher's code ID"
-        )
+        column_config["Human 1"] = st.column_config.SelectboxColumn("Human 1", options=options)
         if n_humans == 2:
-            column_config["Human 2"] = st.column_config.SelectboxColumn(
-                "Human 2", options=options, help="Second human coder's code ID"
-            )
+            column_config["Human 2"] = st.column_config.SelectboxColumn("Human 2", options=options)
     else:
-        st.caption("Multi-code mode: enter multiple code IDs separated by commas in the human-code columns.")
+        st.caption("Multi-code mode: enter multiple code IDs separated by commas.")
 
-    calibration_table = st.data_editor(
-        existing,
-        column_config=column_config,
-        num_rows="dynamic",
-        width="stretch",
-        hide_index=True,
-        key=f"calibration_editor_{active.version_id}_{n_humans}_{snapshot.coding_mode}",
+    editor_key = (
+        f"calibration_editor_{active.version_id}_{n_humans}_{snapshot.coding_mode}_"
+        f"{st.session_state.calibration_editor_epoch}"
     )
-    st.session_state.calibration_table = calibration_table
+    with st.form(f"calibration_form_{editor_key}"):
+        calibration_table = st.data_editor(
+            st.session_state.calibration_table,
+            column_config=column_config,
+            num_rows="dynamic",
+            width="stretch",
+            hide_index=True,
+            key=editor_key,
+        )
+        run_calibration = st.form_submit_button("Run AI coding & compare", type="primary")
 
-    if st.button("Run AI coding & compare", type="primary"):
+    if run_calibration:
+        st.session_state.calibration_table = calibration_table.copy()
         valid = calibration_table[calibration_table["Text"].astype(str).str.strip() != ""].copy()
         valid = valid[valid["Human 1"].astype(str).str.strip() != ""].copy()
         if n_humans == 2:
@@ -607,7 +662,7 @@ def stage2() -> None:
                 elif n_ok == 0:
                     st.error("AI coding returned errors for all cases. See the AI Error column below.")
                 else:
-                    st.warning(f"AI coding completed for {n_ok} of {len(valid)} cases. See the AI Error column for failures.")
+                    st.warning(f"AI coding completed for {n_ok} of {len(valid)} cases.")
 
     results = st.session_state.calibration_results
     if results is None:
@@ -620,7 +675,6 @@ def stage2() -> None:
         st.error("No AI-coded cases completed successfully.")
         return
 
-    metric_values: dict[str, float | None] = {}
     pairs: list[tuple[str, str, str]] = [("Human 1 vs AI", "Human 1", "AI Code")]
     if n_humans == 2:
         pairs.extend(
@@ -630,19 +684,17 @@ def stage2() -> None:
             ]
         )
 
+    metric_values: dict[str, float | None] = {}
     cols = st.columns(len(pairs))
     for col, (label, a_col, b_col) in zip(cols, pairs):
-        metrics = pair_metrics(usable[a_col], usable[b_col], snapshot.coding_mode)
         with col:
-            st.markdown(f"**{label}**")
+            metrics = render_metric_pair(label, usable[a_col], usable[b_col], snapshot.coding_mode)
             for metric_name, value in metrics.items():
                 metric_values[f"{label}: {metric_name}"] = value
-                pretty = metric_name.replace("_", " ").title()
-                st.metric(pretty, "N/A" if value is None else f"{value:.2f}")
 
     st.caption(
-        "The app reports agreement statistics but does not declare a protocol 'validated' at an automatic threshold. "
-        "Interpretation remains a methodological decision for the research team."
+        f"Reliability statistics are based on {len(usable)} usable calibration case(s). "
+        "The app reports the statistics but does not automatically declare a protocol validated at a fixed threshold."
     )
 
     if st.button("Save this calibration summary in the project"):
@@ -660,8 +712,7 @@ def stage2() -> None:
     st.markdown("### Inspect a specific AI decision")
     case_options = [str(x) for x in usable["Case ID"].tolist()]
     selected_case = st.selectbox("Case", case_options, key="explain_case_select")
-    default_question = "Why did you assign this code?"
-    question = st.text_input("Question for Gemini", value=default_question, key="case_question")
+    question = st.text_input("Question for Gemini", value="Why did you assign this code?", key="case_question")
     if st.button("Ask about this coding decision"):
         row = usable[usable["Case ID"].astype(str) == selected_case].iloc[0]
         service = get_service()
@@ -683,12 +734,9 @@ def stage2() -> None:
 
     st.divider()
     st.markdown("### Use disagreements to refine the protocol")
-    st.write(
-        "Gemini can propose changes based on the disagreement cases. The proposal is only a draft; accepting it returns you to Stage 1, where you can inspect/edit it and freeze a new protocol version."
-    )
     refinement_request = st.text_area(
         "Optional guidance",
-        placeholder="e.g., Focus on clarifying the boundary between A2 and A3; do not add new categories unless necessary.",
+        placeholder="e.g., Clarify the boundary between A2 and A3; do not add new categories unless necessary.",
         key="refinement_request",
     )
     if st.button("Suggest protocol refinements"):
@@ -702,12 +750,11 @@ def stage2() -> None:
                     request = refinement_request.strip() or (
                         "Review the disagreement cases and propose the smallest justified changes to improve clarity and coding consistency."
                     )
-                    draft = service.redesign_codebook(
+                    st.session_state.refinement_draft = service.redesign_codebook(
                         snapshot,
                         user_request=request,
                         calibration_evidence=evidence,
                     )
-                    st.session_state.refinement_draft = draft
                 except Exception as exc:
                     st.error(f"Could not generate refinement draft: {exc}")
 
@@ -732,7 +779,7 @@ def stage2() -> None:
         st.dataframe(preview, hide_index=True, width="stretch")
         c1, c2 = st.columns(2)
         if c1.button("Accept as new working draft", type="primary"):
-            project.codes = draft.codes
+            project.codes = [code.model_copy(deep=True) for code in draft.codes]
             project.general_instructions = draft.general_instructions
             project.mark_draft_changed()
             reset_run_state()
@@ -744,35 +791,38 @@ def stage2() -> None:
 
 
 def stage3() -> None:
+    project = get_project()
     st.header("Stage 3 · Code the Full Dataset")
     active = project.get_active_version()
     if not active:
         st.warning("Freeze a protocol version in Stage 1 before full-dataset coding.")
         return
+
     snapshot = active.snapshot
     st.info(
         f"This run will use frozen protocol **{active.version_id}** ({len(snapshot.codes)} codes, {snapshot.coding_mode} mode)."
     )
     if project.draft_dirty:
-        st.warning("The working draft has newer changes; they are not part of this batch. Freeze them as a new version if you want to use them.")
+        st.warning("The working draft has newer changes; they are not part of this batch.")
 
-    dataset_file = st.file_uploader(
-        "Upload dataset", type=["csv", "xlsx", "xls", "sav"], key="batch_dataset_upload"
-    )
-    if st.button("Load dataset"):
+    dataset_file = st.file_uploader("Upload dataset", type=["csv", "xlsx", "xls", "sav"], key="batch_dataset_upload")
+    c1, c2 = st.columns(2)
+    if c1.button("Load uploaded dataset"):
         if not dataset_file:
             st.warning("Choose a dataset file first.")
         else:
             try:
-                st.session_state.batch_source_df = read_tabular_file(
-                    dataset_file.name, dataset_file.getvalue()
-                )
+                st.session_state.batch_source_df = read_tabular_file(dataset_file.name, dataset_file.getvalue())
                 st.session_state.batch_results = None
                 st.success(
                     f"Loaded {len(st.session_state.batch_source_df)} rows and {len(st.session_state.batch_source_df.columns)} columns."
                 )
             except Exception as exc:
                 st.error(f"Could not read dataset: {exc}")
+    if c2.button("Load built-in demo dataset"):
+        st.session_state.batch_source_df = demo_batch_dataset()
+        st.session_state.batch_results = None
+        st.rerun()
 
     source_df = st.session_state.batch_source_df
     if source_df is None:
@@ -792,13 +842,11 @@ def stage3() -> None:
     )
 
     st.warning(
-        f"This deployment is configured for a maximum of {MAX_BATCH_ROWS} rows per batch run to control prototype/API costs."
+        f"This deployment allows at most {MAX_BATCH_ROWS} rows per batch run to control prototype/API costs."
     )
     if st.button("Run full-dataset coding", type="primary"):
         if len(source_df) > MAX_BATCH_ROWS:
-            st.error(
-                f"Dataset has {len(source_df)} rows. This deployment allows at most {MAX_BATCH_ROWS} per run."
-            )
+            st.error(f"Dataset has {len(source_df)} rows. This deployment allows at most {MAX_BATCH_ROWS}.")
         else:
             service = get_service()
             if service:
@@ -808,7 +856,9 @@ def stage3() -> None:
                 errors: list[str] = []
                 label_map = {c.code_id: c.name for c in snapshot.codes}
                 progress = st.progress(0)
+                status = st.empty()
                 for pos, (_, row) in enumerate(output.iterrows(), start=1):
+                    status.info(f"Coding row {pos} of {len(output)} with Gemini…")
                     text = "" if pd.isna(row[text_column]) else str(row[text_column])
                     if not text.strip():
                         ai_codes.append("")
@@ -816,9 +866,7 @@ def stage3() -> None:
                         errors.append("Blank text; not sent to model")
                         progress.progress(pos / len(output))
                         continue
-                    context = {
-                        col: (None if pd.isna(row[col]) else row[col]) for col in context_columns
-                    }
+                    context = {col: (None if pd.isna(row[col]) else row[col]) for col in context_columns}
                     try:
                         codes = service.code_case(snapshot, text, context)
                         ai_codes.append("; ".join(codes))
@@ -829,6 +877,7 @@ def stage3() -> None:
                         ai_labels.append("")
                         errors.append(str(exc))
                     progress.progress(pos / len(output))
+                status.empty()
 
                 output["AI_Code"] = ai_codes
                 output["AI_Code_Label"] = ai_labels
@@ -847,10 +896,6 @@ def stage3() -> None:
 
     output = result_bundle["df"]
     st.markdown("### Results")
-    st.caption(
-        f"These results used text column `{result_bundle['text_column']}` and context columns: "
-        + (", ".join(result_bundle["context_columns"]) or "none")
-    )
     successful = int((output["AI_Error"] == "").sum())
     st.success(f"Completed: {successful}/{len(output)} rows coded without an application/API error.")
     st.dataframe(output.head(100), width="stretch", hide_index=True)
@@ -901,11 +946,10 @@ def stage3() -> None:
         file_name=f"{base_name}_{active.version_id}_audit.json",
         mime="application/json",
     )
-    st.caption(
-        "The audit record contains the frozen protocol and run configuration, but not the participant dataset itself."
-    )
+    st.caption("The audit record contains the frozen protocol and run configuration, but not the participant dataset itself.")
 
 
+enforce_reviewer_gate()
 page = show_sidebar()
 
 st.title(APP_TITLE)
