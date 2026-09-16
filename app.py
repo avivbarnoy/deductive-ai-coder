@@ -68,6 +68,7 @@ def initialize_state() -> None:
         "case_explanation": "",
         "batch_source_df": None,
         "batch_results": None,
+        "batch_text_column": None,
         "nav_page": PAGES[0],
         "reviewer_authenticated": False,
     }
@@ -142,6 +143,54 @@ def protocol_status(project: ResearchProject) -> str:
     return "No protocol version frozen yet"
 
 
+def is_bundled_demo_project(project: ResearchProject) -> bool:
+    active = project.get_active_version()
+    if not active or project.project_name != "Example deductive coding project":
+        return False
+    return {code.code_id for code in active.snapshot.codes} == {"A", "B", "C", "X"}
+
+
+def preferred_text_column(columns: list[str]) -> str:
+    if not columns:
+        raise ValueError("Dataset has no columns")
+    normalized = {str(col).strip().lower().replace("-", "_").replace(" ", "_"): str(col) for col in columns}
+    candidates = [
+        "response",
+        "text",
+        "answer",
+        "comment",
+        "open_response",
+        "open_ended_response",
+        "open_text",
+        "verbatim",
+        "transcript",
+        "excerpt",
+    ]
+    for candidate in candidates:
+        if candidate in normalized:
+            return normalized[candidate]
+    for candidate in candidates:
+        for normalized_name, original in normalized.items():
+            if candidate in normalized_name:
+                return original
+    return columns[0]
+
+
+def looks_like_identifier_column(column_name: str) -> bool:
+    normalized = str(column_name).strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized in {
+        "id",
+        "case_id",
+        "caseid",
+        "participant_id",
+        "participantid",
+        "respondent_id",
+        "respondentid",
+        "record_id",
+        "recordid",
+    } or normalized.endswith("_id")
+
+
 def code_rows(project: ResearchProject) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for code in project.codes:
@@ -211,10 +260,10 @@ def demo_calibration_table(n_humans: int) -> pd.DataFrame:
 def demo_batch_dataset() -> pd.DataFrame:
     return pd.DataFrame(
         [
-            {"case_id": "1", "response": "Official statistics show the rate has decreased.", "context": ""},
-            {"case_id": "2", "response": "I experienced this myself last year.", "context": ""},
-            {"case_id": "3", "response": "Everyone deserves equal treatment, so this is wrong.", "context": ""},
-            {"case_id": "4", "response": "I chose this option randomly.", "context": ""},
+            {"response": "Official statistics show the rate has decreased.", "case_id": "1", "context": ""},
+            {"response": "I experienced this myself last year.", "case_id": "2", "context": ""},
+            {"response": "Everyone deserves equal treatment, so this is wrong.", "case_id": "3", "context": ""},
+            {"response": "I chose this option randomly.", "case_id": "4", "context": ""},
         ]
     )
 
@@ -295,6 +344,7 @@ def show_sidebar() -> str:
                     reset_calibration_editor()
                     reset_run_state()
                     st.session_state.batch_source_df = None
+                    st.session_state.batch_text_column = None
                     st.success("Project loaded.")
                     st.rerun()
                 except Exception as exc:
@@ -317,6 +367,7 @@ def show_sidebar() -> str:
             reset_calibration_editor()
             reset_run_state()
             st.session_state.batch_source_df = None
+            st.session_state.batch_text_column = None
             st.rerun()
 
         st.divider()
@@ -572,13 +623,18 @@ def stage2() -> None:
     signature = (active.version_id, n_humans, snapshot.coding_mode)
     if st.session_state.calibration_signature != signature:
         st.session_state.calibration_signature = signature
-        st.session_state.calibration_table = blank_calibration_table(n_humans)
+        if is_bundled_demo_project(project):
+            st.session_state.calibration_table = demo_calibration_table(n_humans)
+        else:
+            st.session_state.calibration_table = blank_calibration_table(n_humans)
         st.session_state.calibration_results = None
         st.session_state.refinement_draft = None
         st.session_state.case_explanation = ""
         reset_calibration_editor()
 
     st.markdown("### Calibration cases")
+    if is_bundled_demo_project(project):
+        st.info("Synthetic calibration cases are preloaded for the bundled sample project so reviewers can run Stage 2 immediately.")
     st.caption(
         "Edits in this table are submitted together when you press **Run AI coding & compare**. "
         "This prevents Streamlit reruns from clearing the first edit."
@@ -812,16 +868,18 @@ def stage3() -> None:
             st.warning("Choose a dataset file first.")
         else:
             try:
-                st.session_state.batch_source_df = read_tabular_file(dataset_file.name, dataset_file.getvalue())
+                loaded_df = read_tabular_file(dataset_file.name, dataset_file.getvalue())
+                st.session_state.batch_source_df = loaded_df
                 st.session_state.batch_results = None
-                st.success(
-                    f"Loaded {len(st.session_state.batch_source_df)} rows and {len(st.session_state.batch_source_df.columns)} columns."
-                )
+                loaded_columns = [str(c) for c in loaded_df.columns]
+                st.session_state.batch_text_column = preferred_text_column(loaded_columns) if loaded_columns else None
+                st.success(f"Loaded {len(loaded_df)} rows and {len(loaded_df.columns)} columns.")
             except Exception as exc:
                 st.error(f"Could not read dataset: {exc}")
     if c2.button("Load built-in demo dataset"):
         st.session_state.batch_source_df = demo_batch_dataset()
         st.session_state.batch_results = None
+        st.session_state.batch_text_column = "response"
         st.rerun()
 
     source_df = st.session_state.batch_source_df
@@ -834,16 +892,22 @@ def stage3() -> None:
 
     st.dataframe(source_df.head(20), width="stretch", hide_index=True)
     columns = [str(c) for c in source_df.columns]
-    text_column = st.selectbox("Column containing text to code", columns)
+    if st.session_state.batch_text_column not in columns:
+        st.session_state.batch_text_column = preferred_text_column(columns)
+    text_column = st.selectbox("Column containing text to code", columns, key="batch_text_column")
+    st.info(f"AI will code the text in column **{text_column}**.")
+    if looks_like_identifier_column(text_column):
+        st.warning(
+            f"**{text_column}** looks like an identifier column rather than qualitative text. "
+            "Select the response/text column before running AI coding."
+        )
     context_columns = st.multiselect(
         "Optional case-level context columns to send to the AI",
         [c for c in columns if c != text_column],
         help="Choose only variables that are methodologically relevant and appropriate to send to the configured AI service.",
     )
 
-    st.warning(
-        f"This deployment allows at most {MAX_BATCH_ROWS} rows per batch run to control prototype/API costs."
-    )
+    st.warning(f"This deployment allows at most {MAX_BATCH_ROWS} rows per batch run to control prototype/API costs.")
     if st.button("Run full-dataset coding", type="primary"):
         if len(source_df) > MAX_BATCH_ROWS:
             st.error(f"Dataset has {len(source_df)} rows. This deployment allows at most {MAX_BATCH_ROWS}.")
@@ -898,6 +962,7 @@ def stage3() -> None:
     st.markdown("### Results")
     successful = int((output["AI_Error"] == "").sum())
     st.success(f"Completed: {successful}/{len(output)} rows coded without an application/API error.")
+    st.caption(f"AI coded text from column: **{result_bundle['text_column']}**")
     st.dataframe(output.head(100), width="stretch", hide_index=True)
 
     st.markdown("### Export")
