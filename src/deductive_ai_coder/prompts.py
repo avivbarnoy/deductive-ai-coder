@@ -56,6 +56,11 @@ CODING MODE:
 CODEBOOK:
 {codebook_as_text(snapshot)}
 
+DECISION RULES:
+- Evaluate the substantive codes first and apply the most specific code(s) that are supported by the text and permitted context.
+- If the codebook contains a residual/fallback category such as "other", "uncodable", or "no applicable code", use it only when no more specific substantive code is supported.
+- Do not use a fallback category merely because the text is brief; brief text can still support a substantive code.
+
 CASE CONTEXT (may be empty):
 {context_json}
 
