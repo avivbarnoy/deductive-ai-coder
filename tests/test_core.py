@@ -56,6 +56,20 @@ def test_prompt_uses_project_codebook_not_fixed_domain_categories():
     assert "I saw this myself." in prompt
 
 
+def test_prompt_treats_residual_codes_as_fallback_only():
+    project = ResearchProject(
+        project_name="Fallback demo",
+        codes=[
+            CodeDefinition(code_id="A", name="Evidence", definition="Appeals to evidence"),
+            CodeDefinition(code_id="X", name="No applicable deductive code", definition="Use when no substantive code applies"),
+        ],
+    )
+    prompt = coding_prompt(project.current_snapshot(), "Official statistics show the rate has decreased.")
+    assert "Evaluate the substantive codes first" in prompt
+    assert "use it only when no more specific substantive code is supported" in prompt
+    assert "brief text can still support a substantive code" in prompt
+
+
 def test_single_code_metrics():
     metrics = pair_metrics(["A", "A", "B"], ["A", "B", "B"], "single")
     assert round(metrics["raw_agreement"], 3) == 0.667
